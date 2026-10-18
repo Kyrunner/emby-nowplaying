@@ -1,0 +1,36 @@
+{
+  "schemaVersion": 1,
+  "id": "ky.emby-nowplaying",
+  "name": "Emby Now Playing",
+  "version": "0.1.0",
+  "author": "Kyrunner",
+  "license": "MIT",
+  "description": "What is playing on Emby, with poster artwork, transport controls, and whether the server is transcoding.",
+  "kinds": [
+    "bar-widget"
+  ],
+  "entryPoints": {
+    "barWidget": "Panel.qml"
+  },
+  "barWidget": {
+    "displayName": "Emby",
+    "description": "Shows active Emby streams with poster art, viewer, device, progress, bitrate, and a direct-play vs transcode badge — with play/pause, 30s seek, skip, stop and volume for clients that allow remote control.",
+    "category": "Media",
+    "allowMultiple": false,
+    "defaultSection": "right",
+    "defaults": {
+      "refreshIntervalSec": 10
+    },
+    "schema": [
+      {
+        "key": "refreshIntervalSec",
+        "type": "integer",
+        "label": "Refresh interval (seconds)",
+        "min": 5,
+        "max": 300,
+        "step": 5,
+        "defaultValue": 10
+      }
+    ]
+  }
+}

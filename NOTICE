@@ -1,0 +1,14 @@
+This plugin is MIT licensed. See LICENSE.
+
+emby.svg and emby.png are unmodified icons from
+homarr-labs/dashboard-icons
+(https://github.com/homarr-labs/dashboard-icons),
+licensed under the Apache License, Version 2.0.
+Copyright (c) 2024 Bjorn Lammers, Meier Lukas, Thomas Camlong and Homarr Labs.
+The Apache-2.0 license text is at https://www.apache.org/licenses/LICENSE-2.0
+
+The Emby name and logo are trademarks of their owner. They are used here to
+identify an Emby server. This plugin is not affiliated with or endorsed by Emby.
+
+preview.png is a generated placeholder. It is not a screenshot of a real
+Emby library and contains no library metadata.
