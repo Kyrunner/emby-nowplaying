@@ -1,0 +1,388 @@
+#!/usr/bin/env python3
+"""Shared Emby plumbing: config, and one request path with endpoint failover.
+
+Two addresses. `url` is the LAN server origin and is always tried first;
+`public_url` is reached only when the LAN one fails, so the widget keeps
+working away from home without dragging an all-day poll across the public
+edge while at home. Both the poll and the transport controls come through
+here, so a command sent away from home takes the same road as the poll that
+showed the stream.
+
+Emby documents the API at ``http[s]://hostname:port/emby/{apipath}`` and the
+credential header ``X-Emby-Token``. `url` and `public_url` are server origins
+(no ``/emby`` suffix required); this module appends ``/emby`` itself. The
+token is never placed in a query string.
+
+As a script:
+    emby.py config      print url / token / web_base / public_url, one per line
+    emby.py sessions    print the chosen endpoint name, its API base, then /Sessions
+
+The token is read from the config file path, never taken from argv, so it stays
+out of `ps`.
+"""
+
+import json
+import os
+import stat
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+
+CONFIG = os.environ.get("OMARCHY_EMBY_CONFIG") or os.path.expanduser(
+    "~/.config/omarchy-emby/config.json"
+)
+STATE_DIR = os.path.join(
+    os.environ.get("XDG_STATE_HOME") or os.path.expanduser("~/.local/state"),
+    "omarchy-emby",
+)
+ENDPOINT_FILE = os.path.join(STATE_DIR, "endpoint.json")
+
+# Long enough that moving around the house does not thrash the choice, short
+# enough that coming home restores the LAN path without intervention.
+PUBLIC_STICKY_SEC = 600
+LAN_TIMEOUT = 2.5
+PUBLIC_TIMEOUT = 10
+
+# A reply is read up to this many bytes and no further. /Sessions for a busy
+# server is tens of KB; anything past this is not Emby answering us.
+MAX_RESPONSE_BYTES = 4 * 1024 * 1024
+
+
+class AuthError(Exception):
+    """Bad credentials. Deliberately never triggers endpoint failover: retrying a
+    wrong token against a public edge is how you get banned by your own rate
+    limiter.
+
+    Emby's user-auth guide names 401 as the revoked-token status. 403 is
+    documented separately as "no permission", so it is not treated as this.
+    """
+
+
+class EndpointRefused(Exception):
+    """The endpoint is not one the token may be sent to, or its reply is not one we
+    will parse. The message is what the widget shows."""
+
+
+class _NoRedirects(urllib.request.HTTPRedirectHandler):
+    """urllib copies request headers onto a redirected request, so following a 3xx
+    would replay X-Emby-Token to wherever Location points. Returning None makes
+    the redirect surface as an HTTPError instead."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+_OPENER = urllib.request.build_opener(_NoRedirects)
+
+
+def api_root(base):
+    """Server origin -> API root. ``http://host:8096`` becomes ``.../emby``.
+
+    An origin that already ends in ``/emby`` is left alone, so a pasted base
+    path is not doubled.
+    """
+    base = (base or "").rstrip("/")
+    if base.endswith("/emby"):
+        return base
+    return base + "/emby"
+
+
+def load_config():
+    """-> dict with url, token, web_base, public_url. Raises ValueError with the
+    fault name backend.sh reports ("not configured" / "bad config")."""
+    try:
+        with open(CONFIG) as fh:
+            c = json.load(fh)
+    except FileNotFoundError:
+        raise ValueError("not configured")
+    except Exception:
+        raise ValueError("bad config")
+    if not isinstance(c, dict):
+        raise ValueError("bad config")
+
+    url = str(c.get("url") or "").strip().rstrip("/")
+    # Stripped because a key pasted from the dashboard often carries a
+    # trailing newline, which the server rejects as an invalid token.
+    token = str(c.get("token") or "").strip()
+    # web_base is for BROWSER links; it falls back to url when unset.
+    # It stays a server origin: the web client lives at /web/, not under /emby.
+    web_base = (str(c.get("web_base") or "").strip().rstrip("/")) or url
+    # public_url is the API fallback. It defaults to web_base because the public
+    # web UI is the same Emby and serves the API too. An explicit "" opts out.
+    if "public_url" in c:
+        public_url = str(c.get("public_url") or "").strip().rstrip("/")
+    else:
+        public_url = web_base
+    if public_url == url:
+        public_url = ""   # the same address twice is not a fallback
+    return {"url": url, "token": token, "web_base": web_base, "public_url": public_url}
+
+
+def _open_dir_at(parent_fd, name, create):
+    """Open one path component relative to its parent's descriptor.
+
+    O_NOFOLLOW makes a symlink at this component an error rather than a
+    redirect; creating with mkdir(dir_fd=...) means a missing component is made
+    inside the directory we already hold, not wherever the path now points.
+    """
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW
+    try:
+        return os.open(name, flags, dir_fd=parent_fd)
+    except FileNotFoundError:
+        if not create:
+            raise
+        try:
+            os.mkdir(name, 0o700, dir_fd=parent_fd)
+        except FileExistsError:
+            pass  # raced with another run of ourselves; the open below re-checks it
+        return os.open(name, flags, dir_fd=parent_fd)
+
+
+def _check_ancestor(fd):
+    """A directory above the state directory must be one nobody else can swap
+    our path out of: owned by root or by us, and not writable by others --
+    unless it is root-owned and sticky (/tmp), where others may add entries
+    but cannot rename or remove ours.
+    """
+    st = os.fstat(fd)
+    if st.st_uid not in (0, os.getuid()):
+        raise PermissionError("a directory above the state directory is not ours")
+    if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+        if not (st.st_uid == 0 and st.st_mode & stat.S_ISVTX):
+            raise PermissionError("a directory above the state directory is writable by others")
+
+
+def _state_dir_fd():
+    """A descriptor for the state directory, or an exception.
+
+    The directory is reached by walking its absolute path one component at a
+    time from "/", each opened O_NOFOLLOW relative to the descriptor of the one
+    before and owner-checked before the walk continues. No component is ever
+    looked up by path, so a symlink swapped in anywhere along it -- including
+    ~/.local/state itself -- is refused instead of followed, and nothing can be
+    renamed out from under a directory we have already checked.
+
+    Every state read and write then goes through the returned descriptor, so
+    the state directory cannot be swapped between this check and its use.
+    """
+    path = os.path.abspath(STATE_DIR)
+    parts = [p for p in path.split(os.sep) if p]
+    if not parts:
+        raise PermissionError("state directory cannot be /")
+    fd = os.open("/", os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        _check_ancestor(fd)
+        for i, name in enumerate(parts):
+            if name in (".", ".."):
+                raise PermissionError("state path is not normalised")
+            last = i == len(parts) - 1
+            nfd = _open_dir_at(fd, name, create=True)
+            os.close(fd)
+            fd = nfd
+            if not last:
+                _check_ancestor(fd)
+        st = os.fstat(fd)
+        if st.st_uid != os.getuid():
+            raise PermissionError("state directory is not ours")
+        if st.st_mode & (stat.S_IWGRP | stat.S_IWOTH):
+            # Anyone who can write here can plant the file we are about to open.
+            raise PermissionError("state directory is writable by others")
+    except Exception:
+        os.close(fd)
+        raise
+    return fd
+
+
+def _load_json(path, default):
+    dfd = None
+    try:
+        dfd = _state_dir_fd()
+        fd = os.open(os.path.basename(path), os.O_RDONLY | os.O_NOFOLLOW, dir_fd=dfd)
+        with os.fdopen(fd) as f:
+            return json.load(f)
+    except Exception:
+        return default
+    finally:
+        if dfd is not None:
+            os.close(dfd)
+
+
+def _save_json(path, data):
+    """Publish state atomically, without trusting anything already on disk.
+
+    The temp name is random and created with O_EXCL, so a file already sitting
+    at that name is a failure rather than something to write through; O_NOFOLLOW
+    means a symlink there is never followed. Without both, the predictable
+    "<file>.tmp" name let anything that could write this directory choose which
+    file the poll truncated.
+    """
+    name = os.path.basename(path)
+    dfd = None
+    tmp = None
+    try:
+        dfd = _state_dir_fd()
+        tmp = ".%s.%s.tmp" % (name, os.urandom(8).hex())
+        fd = os.open(
+            tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW, 0o600, dir_fd=dfd
+        )
+        with os.fdopen(fd, "w") as f:
+            json.dump(data, f)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
+        tmp = None
+    except Exception:
+        pass  # remembering the endpoint is an optimisation, never a requirement
+    finally:
+        if dfd is not None:
+            if tmp is not None:
+                try:
+                    os.unlink(tmp, dir_fd=dfd)
+                except OSError:
+                    pass
+            os.close(dfd)
+
+
+def _call(which, base, token, path, method, timeout, body):
+    url = base + path
+    # The LAN address may be plain HTTP on a trusted network; the public one
+    # carries the token across the internet and must be HTTPS.
+    if which == "public" and urllib.parse.urlsplit(url).scheme != "https":
+        raise EndpointRefused("public_url must be https")
+    headers = {"X-Emby-Token": token}
+    data = None
+    if method == "POST":
+        if body is None:
+            data = b""
+        else:
+            data = json.dumps(body).encode("utf-8")
+            headers["Content-Type"] = "application/json"
+    req = urllib.request.Request(url, data=data, headers=headers, method=method)
+    try:
+        with _OPENER.open(req, timeout=timeout) as r:
+            if r.geturl() != url:
+                raise EndpointRefused("redirected")
+            raw = r.read(MAX_RESPONSE_BYTES + 1)
+            if len(raw) > MAX_RESPONSE_BYTES:
+                raise EndpointRefused("response too large")
+            raw = raw.decode("utf-8")
+            return json.loads(raw) if raw.strip() else None
+    except urllib.error.HTTPError as e:
+        # 401: "Unauthorized. Client needs to authenticate." A revoked token is
+        # documented as 401. 403 is "Forbidden. No permission" and stays an HTTP
+        # error so a permission problem is not reported as a bad key.
+        if e.code == 401:
+            raise AuthError("auth failed")
+        raise
+
+
+# Once an endpoint has answered in this process, every later call uses it
+# directly, so a seek (one GET, one POST) pays the LAN timeout at most once.
+_chosen = None
+
+
+def request(cfg, path, method="GET", body=None):
+    """Call Emby, preferring the LAN address and falling back to the public one.
+
+    `path` is the API path under ``/emby`` (for example ``/Sessions``).
+    The endpoint choice is persisted because these scripts run as a fresh process
+    per poll: with no memory, every poll away from home would pay the LAN timeout
+    before falling back.
+    """
+    global _chosen
+    if _chosen:
+        return _call(_chosen[0], _chosen[1], cfg["token"], path, method, _chosen[2], body)
+
+    lan, public = cfg["url"], cfg["public_url"]
+    state = _load_json(ENDPOINT_FILE, {})
+    on_public = state.get("which") == "public"
+    fresh = (time.time() - float(state.get("since") or 0)) < PUBLIC_STICKY_SEC
+
+    if on_public and fresh and public:
+        order = [("public", public, PUBLIC_TIMEOUT)]
+    else:
+        order = ([("lan", lan, LAN_TIMEOUT)] if lan else []) + \
+                ([("public", public, PUBLIC_TIMEOUT)] if public else [])
+
+    last = None
+    for which, base, tmo in order:
+        root = api_root(base)
+        try:
+            result = _call(which, root, cfg["token"], path, method, tmo, body)
+            _chosen = (which, root, tmo)
+            if which != state.get("which") or which == "public":
+                _save_json(ENDPOINT_FILE, {"which": which, "since": time.time()})
+            return result
+        except AuthError:
+            raise      # not an endpoint problem; do not hammer the public edge with it
+        except Exception as e:
+            last = e
+
+    # A sticky public choice can go stale (came home, wifi changed). One retry of
+    # the full order beats staying wedged on an endpoint that is gone.
+    if on_public and fresh and lan:
+        _save_json(ENDPOINT_FILE, {})
+        return request(cfg, path, method, body)
+
+    raise last or RuntimeError("no endpoint configured")
+
+
+def current_endpoint():
+    if _chosen:
+        return _chosen[0], _chosen[1]
+    which = _load_json(ENDPOINT_FILE, {}).get("which") or "lan"
+    return which, None
+
+
+# ---- script entry points, for backend.sh --------------------------------------
+
+def _fail(msg):
+    print(json.dumps({"ok": False, "error": msg, "streams": []}, separators=(",", ":")))
+    return 1
+
+
+def _main(argv):
+    mode = argv[0] if argv else ""
+    if mode == "config":
+        try:
+            cfg = load_config()
+        except ValueError:
+            return 1
+        for k in ("url", "token", "web_base", "public_url"):
+            print(cfg[k])
+        return 0
+
+    if mode == "sessions":
+        try:
+            cfg = load_config()
+        except ValueError as e:
+            return _fail(str(e))
+        if not cfg["url"] or not cfg["token"]:
+            return _fail("bad config")
+        try:
+            sessions = request(cfg, "/Sessions")
+        except AuthError:
+            return _fail("auth failed")
+        except EndpointRefused as e:
+            return _fail(str(e))
+        except urllib.error.HTTPError as e:
+            return _fail("http %d" % e.code)
+        except Exception:
+            return _fail("unreachable")
+        which, base = current_endpoint()
+        # Three lines: which endpoint answered, its API base (so posters come
+        # from the address that is actually reachable, including /emby), then
+        # the raw response for flatten.py. None of the first two can contain a
+        # newline.
+        print(which)
+        print(base)
+        print(json.dumps(sessions if sessions is not None else []))
+        return 0
+
+    return _fail("usage: emby.py config|sessions")
+
+
+if __name__ == "__main__":
+    sys.exit(_main(sys.argv[1:]))

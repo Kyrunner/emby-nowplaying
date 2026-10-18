@@ -1,0 +1,88 @@
+[
+  {
+    "_synthetic": true,
+    "note": "SYNTHETIC fixture. Not a capture from a real Emby server and not real library metadata. Placeholder names only. Shape follows SessionInfo, PlayerStateInfo, BaseItemDto, MediaStream and TranscodingInfo as documented at https://dev.emby.media/reference/RestAPI/SessionsService/getSessions.html . SupportsMediaControl is intentionally absent: that flag is on ClientCapabilities, not on the /Sessions SessionInfo schema."
+  },
+  {
+    "Id": "synthetic-session-1",
+    "ServerId": "synthetic-server",
+    "UserId": "synthetic-user",
+    "UserName": "Placeholder Viewer",
+    "Client": "Placeholder Client",
+    "DeviceName": "Placeholder Device",
+    "DeviceId": "synthetic-device",
+    "SupportsRemoteControl": true,
+    "SupportedCommands": ["PlayPause", "Seek", "Stop"],
+    "PlayState": {
+      "PositionTicks": 1000000000,
+      "CanSeek": true,
+      "IsPaused": false,
+      "IsMuted": false,
+      "VolumeLevel": 40
+    },
+    "NowPlayingItem": {
+      "Name": "Placeholder Episode",
+      "Id": "synthetic-item-episode",
+      "Type": "Episode",
+      "SeriesName": "Placeholder Series",
+      "SeriesId": "synthetic-series",
+      "SeriesPrimaryImageTag": "synthetic-series-tag",
+      "IndexNumber": 1,
+      "ParentIndexNumber": 1,
+      "RunTimeTicks": 36000000000,
+      "ServerId": "synthetic-server",
+      "ImageTags": {"Primary": "synthetic-episode-still"},
+      "MediaStreams": [
+        {
+          "Type": "Video",
+          "Codec": "hevc",
+          "BitRate": 8000000,
+          "DisplayTitle": "Placeholder 1080p label",
+          "VideoRange": "SDR"
+        }
+      ]
+    },
+    "TranscodingInfo": {
+      "AudioCodec": "aac",
+      "VideoCodec": "h264",
+      "IsVideoDirect": false,
+      "IsAudioDirect": true,
+      "Bitrate": 4000000,
+      "TranscodeReasons": ["ContainerNotSupported"],
+      "VideoEncoderIsHardware": true,
+      "VideoEncoderHwAccel": "placeholder-hw",
+      "VideoDecoderIsHardware": false
+    }
+  },
+  {
+    "Id": "synthetic-session-2",
+    "ServerId": "synthetic-server",
+    "UserName": "Placeholder Viewer",
+    "Client": "Placeholder Web",
+    "DeviceName": "Placeholder Screen",
+    "SupportsRemoteControl": false,
+    "PlayState": {
+      "PositionTicks": 0,
+      "CanSeek": false,
+      "IsPaused": true,
+      "IsMuted": false
+    },
+    "NowPlayingItem": {
+      "Name": "Placeholder Film",
+      "Id": "synthetic-item-film",
+      "Type": "Movie",
+      "RunTimeTicks": 54000000000,
+      "ServerId": "synthetic-server",
+      "ImageTags": {"Primary": "synthetic-film-tag"},
+      "MediaStreams": [
+        {
+          "Type": "Video",
+          "Codec": "h264",
+          "BitRate": 2500000,
+          "DisplayTitle": "Placeholder film label",
+          "VideoRange": "SDR"
+        }
+      ]
+    }
+  }
+]
