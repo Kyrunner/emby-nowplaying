@@ -79,23 +79,30 @@ PY
 # A world-writable state directory is exactly the precondition the attack needs.
 # Refusing to write there is the fail-closed answer; state is a convenience.
 rm -rf "$XDG_STATE_HOME"; mkdir -p "$STATE"; chmod 0777 "$STATE"
-run_py <<'PY' >/dev/null 2>&1
+refused=$(run_py <<'PY' 2>&1 >/dev/null
 import emby
 emby._save_json(emby.ENDPOINT_FILE, {"which": "public"})
 PY
+)
+refused_rc=$?
 check "world-writable state dir is refused" \
   "absent" "$([ -e "$STATE/endpoint.json" ] && echo present || echo absent)"
+check "world-writable refusal is one stderr line" \
+  "emby: state directory refused; endpoint choice not saved" "$refused"
+check "world-writable refusal keeps exit 0" "0" "$refused_rc"
 
 # ---------------------------------------------------------------- 4. control
 # Without this a fix that just stopped writing would pass every test above.
 rm -rf "$XDG_STATE_HOME"
+ordinary_err="$WORK/ordinary.err"
 check "ordinary state round-trips" \
-  "public" "$(run_py <<'PY' 2>/dev/null
+  "public" "$(run_py <<'PY' 2>"$ordinary_err"
 import emby
 emby._save_json(emby.ENDPOINT_FILE, {"which": "public"})
 print(emby._load_json(emby.ENDPOINT_FILE, {}).get("which"))
 PY
 )"
+check "ordinary save says nothing on stderr" "" "$(cat "$ordinary_err")"
 
 # No leftover temp files, or the next run inherits a name an attacker can predict.
 check "no temp file left behind" \
@@ -106,12 +113,17 @@ check "no temp file left behind" \
 # symlink. Every write would land wherever it points; it must be refused.
 rm -rf "$WORK/real" "$WORK/linked"; mkdir -p "$WORK/real"
 ln -s "$WORK/real" "$WORK/linked"
-XDG_STATE_HOME="$WORK/linked" run_py <<'PY' >/dev/null 2>&1
+link_err=$(XDG_STATE_HOME="$WORK/linked" run_py <<'PY' 2>&1 >/dev/null
 import emby
 emby._save_json(emby.ENDPOINT_FILE, {"which": "public"})
 PY
+)
+link_rc=$?
 check "symlinked state root is not written through" \
   "absent" "$([ -e "$WORK/real/omarchy-emby/endpoint.json" ] && echo present || echo absent)"
+check "symlinked state root refusal is one stderr line" \
+  "emby: state directory refused; endpoint choice not saved" "$link_err"
+check "symlinked state root refusal keeps exit 0" "0" "$link_rc"
 
 mkdir -p "$WORK/real/omarchy-emby"; chmod 0700 "$WORK/real/omarchy-emby"
 printf '{"which": "planted"}\n' > "$WORK/real/omarchy-emby/endpoint.json"

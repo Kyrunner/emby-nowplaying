@@ -13,7 +13,10 @@ quiet, and a genuinely dead server still speaks up within a minute.
 
 This is a minimal port of [jellyfin-nowplaying](https://github.com/Kyrunner/jellyfin-nowplaying) (MIT).
 Where Emby's documented API differs, the difference is called out below rather than papered over.
-Nothing here was verified against a live Emby server.
+Checked on the owner's LAN against Emby 4.10.1.0: `backend.sh` with a real API key returned `ok` and
+`streams: []` (22 idle sessions). A wrong token is `auth failed`, a missing config file is
+`not configured`, a config with no token is `bad config`, and a closed port is `unreachable`, each
+with exit 1. What that run did not cover is listed at the end.
 
 ## Configure
 
@@ -107,8 +110,8 @@ Expected shapes:
 to the API Keys screen, where everything looks correct, while the real fault goes unnamed.
 
 A **403 is not `auth failed`.** Emby's reference describes 401 as "client needs to authenticate" and 403 as
-"no permission". The user-auth guide names 401 as the revoked-token status. 403 is reported as `http 403`.
-The API-key page itself does not name the status a bad key returns; that part still needs a live check.
+"no permission". On 4.10.1.0 a bad or missing API key returned 401, not 403, and the widget reported
+`auth failed`. 403 stays `http 403`.
 
 The four suites run with no server and no credentials:
 
@@ -199,16 +202,19 @@ the owner's server is 4.10.1.0). Checked offline only.
   `PositionTicks` and clamps to one second short of `RunTimeTicks`. `SeekRelative` (4.8+) treats the same
   field as an offset the **client** interprets; it is not sent, because the docs describe it as something
   each client has to add.
-- **Images require authentication** on `GET /Items/{Id}/Images/{Type}` (the reference says so, and lists 401).
-  The poster URL still carries **no token**: QML's `Image` cannot set `X-Emby-Token`, and `api_key=` would
-  put a live key in the URL. Posters may 401 until that is tried on a real server. The URL uses the
-  documented `Tag` and `MaxHeight` parameters, the series `Primary` for an episode (`SeriesId` +
-  `SeriesPrimaryImageTag`) and the item's own `Primary` otherwise, and the API root that actually answered.
+- **Posters on the LAN do not need a token.** The image reference says `GET /Items/{Id}/Images/{Type}`
+  requires authentication and lists 401. On 4.10.1.0, `/emby/Items/{id}/Images/Primary?Tag=…&MaxHeight=180`
+  returned `200 image/jpeg` with no token, and the same path without the `/emby` prefix did too. The URL
+  still carries no credential: QML's `Image` cannot set `X-Emby-Token`, and `api_key=` would put a live key
+  in the URL. Public-URL posters were not tried. The URL uses the documented `Tag` and `MaxHeight`
+  parameters, the series `Primary` for an episode (`SeriesId` + `SeriesPrimaryImageTag`) and the item's own
+  `Primary` otherwise, and the API root that actually answered.
 - **Transcoding hardware.** `TranscodingInfo` has no `HardwareAccelerationType`. The badge uses
   `VideoEncoderIsHardware` / `VideoEncoderHwAccel`, then the decoder pair. `TranscodeReasons`, `Bitrate`,
   `VideoCodec`, `AudioCodec`, `IsVideoDirect` and `IsAudioDirect` are the documented fields and are read
   the same way. `MediaStream` documents `VideoRange` and `DisplayTitle`, not `VideoRangeType`.
-- **Bad token.** 401 → `auth failed`. 403 → `http 403`. Other HTTP statuses stay `http N`. Connection
+- **Bad token.** On 4.10.1.0 a bad or missing key was HTTP 401, reported as `auth failed`. 403 stays
+  `http 403` (the reference: no permission). Other HTTP statuses stay `http N`. Connection
   failure, timeout and a response that is not JSON stay `unreachable`.
 
 ## Transport controls
@@ -255,18 +261,18 @@ Content with no artwork simply shows no thumbnail.
 
 ## What still needs a live Emby
 
-The owner's server was not reachable from this change. These are documented or stubbed, not observed on 4.10.1.0:
+Verified on the owner's LAN, Emby 4.10.1.0:
 
-- That an API key in `X-Emby-Token` is accepted by `GET /emby/Sessions` (the sessions reference says
-  "requires authentication as user"; the API-key guide says keys are for integrations that are not a user).
-- The HTTP status a **bad API key** actually returns. 401 is what the user-auth guide says for a revoked
-  access token. The API-key page does not say.
-- Whether `GET /Items/{Id}/Images/Primary` without a credential returns the image or 401, on the LAN and
-  via the public URL.
-- That absolute `Seek` with both the query and the `PlaystateRequest` body moves a real client by 30s,
-  and that the client's `SupportsRemoteControl` matches the buttons.
-- That `{origin}/web/index.html#!/item?id=&serverId=` opens the item. That route is how self-hosted Emby
-  web is linked in the wild; it is not in the REST reference.
-- The 400ms confirm delay, the 10-minute public sticky window, and poster bytes actually painting in the bar.
-- `omarchy restart shell` / `omarchy-shell shell rescanPlugins` on this plugin's QML, including the case
-  where the Jellyfin README and the skill disagree.
+- An API key in `X-Emby-Token` is accepted on `GET /emby/Sessions` (200).
+- A bad or missing key returns 401, not 403.
+- Poster images load with no token. `/emby/Items/{id}/Images/Primary?Tag=…&MaxHeight=180` returned
+  `200 image/jpeg`, and the same path without the `/emby` prefix did too. Public-URL posters were not tested.
+- `/web/index.html` returns 200, and the item's `ServerId` matches the server id, so the click-through
+  format fits. It was not opened in a browser.
+
+Still open:
+
+- Posters over `public_url`.
+- Transport controls, seek, and volume, and the 400ms confirm delay.
+- The 10-minute public sticky window.
+- QML bar rendering and reload behaviour.

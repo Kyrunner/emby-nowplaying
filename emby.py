@@ -21,6 +21,7 @@ The token is read from the config file path, never taken from argv, so it stays
 out of `ps`.
 """
 
+import errno
 import json
 import os
 import stat
@@ -233,8 +234,16 @@ def _save_json(path, data):
             os.fsync(f.fileno())
         os.replace(tmp, name, src_dir_fd=dfd, dst_dir_fd=dfd)
         tmp = None
-    except Exception:
-        pass  # remembering the endpoint is an optimisation, never a requirement
+    except Exception as e:
+        # Remembering the endpoint is an optimisation. A refused state directory
+        # (writable by the group or by others, or a symlink anywhere in the path)
+        # used to fail silently; say so once on stderr and still return. Other
+        # failures stay quiet. O_NOFOLLOW on a symlink is ENOTDIR with O_DIRECTORY
+        # on this kernel and ELOOP on others.
+        if isinstance(e, PermissionError) or (
+            isinstance(e, OSError) and e.errno in (errno.ELOOP, errno.ENOTDIR)
+        ):
+            print("emby: state directory refused; endpoint choice not saved", file=sys.stderr)
     finally:
         if dfd is not None:
             if tmp is not None:
